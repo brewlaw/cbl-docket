@@ -16,7 +16,23 @@ from googleapiclient.discovery import build
 st.set_page_config(page_title="USPTO Trademark Docketing Manager", layout="wide")
 
 # -----------------------------------------------------------------------------
-# 1. RECURSIVE GMAIL BODY EXTRACTOR & INBOX SYNC
+# 1. DATE HELPER FUNCTION (PREVENTS NaTType ERRORS)
+# -----------------------------------------------------------------------------
+
+def parse_valid_date(val):
+    """Safely converts any date string to datetime.date, falling back to today if missing/invalid."""
+    if not val or pd.isna(val) or str(val).strip().upper() in ["", "N/A", "NONE", "NULL", "NAN", "NAT"]:
+        return datetime.now().date()
+    try:
+        dt = pd.to_datetime(val)
+        if pd.isna(dt):
+            return datetime.now().date()
+        return dt.date()
+    except Exception:
+        return datetime.now().date()
+
+# -----------------------------------------------------------------------------
+# 2. RECURSIVE GMAIL BODY EXTRACTOR & INBOX SYNC
 # -----------------------------------------------------------------------------
 
 def extract_body_recursive(payload):
@@ -56,7 +72,7 @@ def fetch_uspto_emails(max_results=20):
     )
     service = build('gmail', 'v1', credentials=creds)
     
-    # Comprehensive query matching direct USPTO notices & forwarded emails
+    # Query matching direct USPTO notices & forwarded emails
     query = (
         'from:uspto.gov OR from:teas@uspto.gov OR from:TMOfficialNotices@uspto.gov '
         'OR subject:"Official USPTO" OR subject:"FW: Official USPTO" OR subject:"Fwd: Official USPTO" '
@@ -79,7 +95,7 @@ def fetch_uspto_emails(max_results=20):
     return fetched
 
 # -----------------------------------------------------------------------------
-# 2. PARSING & EXTRACTION ENGINE
+# 3. PARSING & EXTRACTION ENGINE
 # -----------------------------------------------------------------------------
 
 def clean_number(val):
@@ -139,7 +155,7 @@ def parse_uspto_email(html_content, subject=""):
         category = "SOU_EXT"
 
     if not category:
-        return None # Skips generic emails (e.g. surveys)
+        return None # Skips non-actionable emails
 
     sn_match = re.search(r'(?:SN|Serial\s*Number|Application\s*serial\s*no\.?|Application\s*SN)\s*:?\s*(\d{8})', full_text, re.IGNORECASE) or re.search(r'\b(\d{8})\b', full_text)
     serial = sn_match.group(1) if sn_match else ""
@@ -200,12 +216,11 @@ def format_docket_records(parsed, df_master):
     records = []
     
     if parsed["category"] == "SOU_EXT":
-        base_dt_str = parsed["allowanceMailDate"] or parsed["issueDate"] or datetime.now().strftime("%Y-%m-%d")
-        try: base_dt = pd.to_datetime(base_dt_str).date()
-        except: base_dt = datetime.now().date()
+        base_dt_str = parsed.get("allowanceMailDate") or parsed.get("issueDate")
+        base_dt = parse_valid_date(base_dt_str)
 
-        ext_num = parsed["extensionNumber"]
-        if not parsed["isFilingReceipt"] and not ext_num:
+        ext_num = parsed.get("extensionNumber")
+        if not parsed.get("isFilingReceipt") and not ext_num:
             dl_6mo = (base_dt + relativedelta(months=6)).strftime("%Y-%m-%d")
             dl_3yr = (base_dt + relativedelta(years=3)).strftime("%Y-%m-%d")
             records.append({"tab": "SOUEXT", "Client": client, "TM": tm, "Docket #": docket, "Appl. #": sn, "Deadline": dl_6mo, "Status": "1st SOU / Extension Deadline (0 Extensions Filed)"})
@@ -220,8 +235,7 @@ def format_docket_records(parsed, df_master):
                 records.append({"tab": "SOUEXT", "Client": client, "TM": tm, "Docket #": docket, "Appl. #": sn, "Deadline": stat_3yr, "Status": "Final Statutory SOU Deadline (Ext 5 Filed - Max Reached)"})
 
     elif parsed["category"] == "OA":
-        try: issue_dt = pd.to_datetime(parsed["issueDate"]).date()
-        except: issue_dt = datetime.now().date()
+        issue_dt = parse_valid_date(parsed.get("issueDate"))
         records.append({
             "tab": "OA", "Client": client, "TM": tm, "Docket #": docket, "Appl. #": sn,
             "OA Issue Date": issue_dt.strftime("%Y-%m-%d"),
@@ -231,8 +245,7 @@ def format_docket_records(parsed, df_master):
         })
 
     elif parsed["category"] == "PUB":
-        try: pub_dt = pd.to_datetime(parsed["publicationDate"]).date()
-        except: pub_dt = datetime.now().date()
+        pub_dt = parse_valid_date(parsed.get("publicationDate") or parsed.get("issueDate"))
         records.append({
             "tab": "Pub", "Client": client, "TM": tm, "Docket #": docket, "Appl. #": sn,
             "Scheduled Publication Date": pub_dt.strftime("%Y-%m-%d"),
@@ -243,7 +256,7 @@ def format_docket_records(parsed, df_master):
     return records
 
 # -----------------------------------------------------------------------------
-# 3. STREAMLIT UI
+# 4. STREAMLIT UI
 # -----------------------------------------------------------------------------
 st.title("🛡️ USPTO Trademark Docketing Manager")
 
