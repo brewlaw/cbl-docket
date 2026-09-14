@@ -16,8 +16,72 @@ from googleapiclient.discovery import build
 st.set_page_config(page_title="USPTO Trademark Docketing Manager", layout="wide")
 
 # -----------------------------------------------------------------------------
-# 1. PARSING & EXTRACTION ENGINE
+# 1. RECURSIVE GMAIL BODY EXTRACTOR & INBOX SYNC
 # -----------------------------------------------------------------------------
+
+def extract_body_recursive(payload):
+    """Recursively walks nested Gmail MIME payload trees to extract text/html or text/plain body."""
+    if 'data' in payload.get('body', {}) and payload['body']['data']:
+        return base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
+    
+    parts = payload.get('parts', [])
+    # 1. Prefer text/html
+    for part in parts:
+        if part.get('mimeType') == 'text/html' and 'data' in part.get('body', {}):
+            return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+        if 'parts' in part:
+            res = extract_body_recursive(part)
+            if res: return res
+
+    # 2. Fallback to text/plain
+    for part in parts:
+        if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
+            return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+        if 'parts' in part:
+            res = extract_body_recursive(part)
+            if res: return res
+
+    return ""
+
+
+def fetch_uspto_emails(max_results=20):
+    """Connects to Gmail API and searches for direct and forwarded USPTO emails."""
+    gmail_secrets = st.secrets["gmail"]
+    creds = OAuthCredentials(
+        token=None,
+        refresh_token=gmail_secrets["refresh_token"],
+        client_id=gmail_secrets["client_id"],
+        client_secret=gmail_secrets["client_secret"],
+        token_uri="https://oauth2.googleapis.com/token"
+    )
+    service = build('gmail', 'v1', credentials=creds)
+    
+    # Comprehensive query matching direct USPTO notices & forwarded emails
+    query = (
+        'from:uspto.gov OR from:teas@uspto.gov OR from:TMOfficialNotices@uspto.gov '
+        'OR subject:"Official USPTO" OR subject:"FW: Official USPTO" OR subject:"Fwd: Official USPTO" '
+        'OR "Notice of Allowance" OR "Notice of Publication" OR "Office Action" OR "Filing Receipt"'
+    )
+    
+    results = service.users().messages().list(userId='me', q=query, maxResults=max_results).execute()
+    messages = results.get('messages', [])
+    fetched = []
+    
+    for m in messages:
+        msg = service.users().messages().get(userId='me', id=m['id'], format='full').execute()
+        headers = msg.get('payload', {}).get('headers', [])
+        subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), '')
+        
+        payload = msg.get('payload', {})
+        body = extract_body_recursive(payload)
+        
+        fetched.append({"subject": subject, "body": body})
+    return fetched
+
+# -----------------------------------------------------------------------------
+# 2. PARSING & EXTRACTION ENGINE
+# -----------------------------------------------------------------------------
+
 def clean_number(val):
     if not val or pd.isna(val): return ""
     s = re.sub(r'\.0$', '', str(val).strip())
@@ -45,7 +109,6 @@ def extract_docket_no(text):
     if not text: return ""
     invalid_words = ["NO", "NUMBER", "SERIAL", "APPLICATION", "US", "SN", "NONE", "NULL", "CONTACTS", "INFORMATION", "ADDRESS", "NAME", "DETAILS"]
     
-    # Strictly require No, Number, or #
     m1 = re.search(r'(?:Docket|Reference|Ref)\s*(?:/\s*(?:Reference|Ref|Docket))?\s*(?:No\.?|Number|\#)\s*:?\s*([A-Z0-9\-_]+)', text, re.IGNORECASE)
     if m1 and m1.group(1).upper() not in invalid_words and len(m1.group(1)) >= 3:
         return m1.group(1).strip()
@@ -62,21 +125,21 @@ def extract_docket_no(text):
     return ""
 
 def parse_uspto_email(html_content, subject=""):
-    soup = BeautifulSoup(html_content, 'html.parser')
-    clean_text = ' '.join(soup.get_text().split())
+    soup = BeautifulSoup(html_content, 'html.parser') if html_content else BeautifulSoup("", 'html.parser')
+    clean_text = ' '.join(soup.get_text().split()) if html_content else ""
     full_text = subject + " " + clean_text
 
-    # Skip generic junk emails
+    # Category Detection
     category = ""
-    if re.search(r'NOTIFICATION\s+OF\s+["\']?NOTICE\s+OF\s+PUBLICATION|scheduled\s+to\s+publish', full_text, re.IGNORECASE):
+    if re.search(r'NOTICE\s*OF\s*PUBLICATION|scheduled\s+to\s+publish|NOTIFICATION\s+OF\s+["\']?NOTICE\s+OF\s+PUBLICATION', full_text, re.IGNORECASE):
         category = "PUB"
-    elif re.search(r'Office\s+Action.*?has\s+issued', full_text, re.IGNORECASE):
+    elif re.search(r'Office\s+Action|OFFICE\s*ACTION', full_text, re.IGNORECASE):
         category = "OA"
     elif re.search(r'NOTICE\s*OF\s*ALLOWANCE|Extension\s*of\s*Time\s*to\s*File\s*a\s*Statement\s*of\s*Use|EXTENSION\s*NUMBER', full_text, re.IGNORECASE):
         category = "SOU_EXT"
 
     if not category:
-        return None # Skips rendering for generic inbox emails
+        return None # Skips generic emails (e.g. surveys)
 
     sn_match = re.search(r'(?:SN|Serial\s*Number|Application\s*serial\s*no\.?|Application\s*SN)\s*:?\s*(\d{8})', full_text, re.IGNORECASE) or re.search(r'\b(\d{8})\b', full_text)
     serial = sn_match.group(1) if sn_match else ""
@@ -123,7 +186,7 @@ def format_docket_records(parsed, df_master):
     sn = parsed["serialNumber"]
     client, tm, docket = parsed["owner"], parsed["wordmark"], parsed["docketNumber"]
 
-    # Relational Lookup
+    # Relational Lookup against Master Docket
     if sn and df_master is not None and not df_master.empty:
         match = df_master[df_master['SerialNumber'].astype(str).str.contains(sn, na=False)]
         if len(match) > 0:
@@ -136,7 +199,6 @@ def format_docket_records(parsed, df_master):
     if not tm: tm = "[Design Mark]"
     records = []
     
-    # Routing Rules
     if parsed["category"] == "SOU_EXT":
         base_dt_str = parsed["allowanceMailDate"] or parsed["issueDate"] or datetime.now().strftime("%Y-%m-%d")
         try: base_dt = pd.to_datetime(base_dt_str).date()
@@ -181,42 +243,6 @@ def format_docket_records(parsed, df_master):
     return records
 
 # -----------------------------------------------------------------------------
-# 2. GMAIL INBOX SYNC
-# -----------------------------------------------------------------------------
-def fetch_uspto_emails(max_results=20):
-    gmail_secrets = st.secrets["gmail"]
-    creds = OAuthCredentials(
-        token=None, refresh_token=gmail_secrets["refresh_token"],
-        client_id=gmail_secrets["client_id"], client_secret=gmail_secrets["client_secret"],
-        token_uri="https://oauth2.googleapis.com/token"
-    )
-    service = build('gmail', 'v1', credentials=creds)
-    query = 'from:uspto.gov OR from:teas@uspto.gov OR from:TMOfficialNotices@uspto.gov OR subject:"FW: Official USPTO" OR subject:"Fwd: Official USPTO"'
-    
-    results = service.users().messages().list(userId='me', q=query, maxResults=max_results).execute()
-    messages = results.get('messages', [])
-    fetched = []
-    
-    for m in messages:
-        msg = service.users().messages().get(userId='me', id=m['id'], format='full').execute()
-        headers = msg.get('payload', {}).get('headers', [])
-        subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), '')
-        
-        # Extract Body
-        payload = msg.get('payload', {})
-        body = ""
-        if 'data' in payload.get('body', {}):
-            body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
-        else:
-            for part in payload.get('parts', []):
-                if part.get('mimeType') in ['text/html', 'text/plain'] and 'data' in part.get('body', {}):
-                    body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
-                    break
-        
-        fetched.append({"subject": subject, "body": body})
-    return fetched
-
-# -----------------------------------------------------------------------------
 # 3. STREAMLIT UI
 # -----------------------------------------------------------------------------
 st.title("🛡️ USPTO Trademark Docketing Manager")
@@ -241,31 +267,30 @@ if st.sidebar.button("Fetch USPTO Emails", type="primary"):
     if "gmail" not in st.secrets:
         st.sidebar.error("Missing [gmail] credentials in Streamlit Secrets.")
     else:
-        with st.spinner("Connecting to Gmail..."):
+        with st.spinner("Scanning Gmail inbox..."):
             try:
                 emails = fetch_uspto_emails(max_results=max_emails)
                 staged = []
                 for em in emails:
                     parsed = parse_uspto_email(em["body"], em["subject"])
-                    if parsed:  # Skips junk emails
+                    if parsed:
                         staged.extend(format_docket_records(parsed, df_master))
 
                 if "st_records" not in st.session_state: st.session_state["st_records"] = []
                 st.session_state["st_records"].extend(staged)
-                st.sidebar.success(f"Scanned {len(emails)} emails. Staged {len(staged)} deadlines.")
+                st.sidebar.success(f"Scanned {len(emails)} emails -> Staged {len(staged)} deadlines!")
+                st.rerun()
             except Exception as e:
-                st.sidebar.error(f"Gmail Error: Verify your Refresh Token. {e}")
+                st.sidebar.error(f"Gmail Error: {e}")
 
 # Review & Export Table
 if "st_records" in st.session_state and st.session_state["st_records"]:
     st.subheader("📋 Staged Deadlines for Export")
     
-    # Load into DataFrame and clean N/A texts to empty strings
     df_staged = pd.DataFrame(st.session_state["st_records"]).fillna("")
     if 'Appl. #' in df_staged.columns:
         df_staged['Appl. #'] = df_staged['Appl. #'].astype(str).str.replace(r'\.0$', '', regex=True)
     
-    # Interactive Table
     edited_df = st.data_editor(df_staged, num_rows="dynamic", use_container_width=True)
 
     col1, col2 = st.columns(2)
@@ -274,7 +299,6 @@ if "st_records" in st.session_state and st.session_state["st_records"]:
             st.session_state["st_records"] = []
             st.rerun()
     with col2:
-        # Export CSV explicitly dropping the backend routing "tab" column
         csv_df = edited_df.drop(columns=["tab"], errors="ignore")
         csv_data = csv_df.to_csv(index=False).encode('utf-8')
         st.download_button("⬇️ Download Formatted Deadlines (.csv)", data=csv_data, file_name="Formatted_TM_Deadlines.csv", mime="text/csv")
