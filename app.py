@@ -6,6 +6,18 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
+# Try importing modular dependencies if available
+try:
+    from src.gmail_client import fetch_uspto_emails
+except ImportError:
+    fetch_uspto_emails = None
+
+try:
+    from src.sheets_client import fetch_master_docket_df, push_records_to_google_sheet
+except ImportError:
+    fetch_master_docket_df = None
+    push_records_to_google_sheet = None
+
 # Page Configuration
 st.set_page_config(page_title="USPTO Trademark Docketing Manager", layout="wide")
 
@@ -273,6 +285,8 @@ def enrich_and_format_docket(parsed_info, df_master):
 st.title("🛡️ Automated USPTO Trademark Docketing Manager")
 
 st.sidebar.header("📁 Data Source & Configuration")
+
+# 1. Master Docket Selection
 uploaded_excel = st.sidebar.file_uploader("Upload Initial Docket Workbook (.xlsx)", type=["xlsx", "xls"])
 
 df_master = None
@@ -281,24 +295,61 @@ if uploaded_excel:
         df_master = pd.read_excel(uploaded_excel, sheet_name="Master Docket")
         st.sidebar.success(f"Loaded Master Docket ({len(df_master)} records)")
     except Exception as e:
-        st.sidebar.error(f"Error reading Master Docket: {e}")
+        st.sidebar.error(f"Error reading uploaded Master Docket: {e}")
+elif fetch_master_docket_df is not None:
+    try:
+        df_master = fetch_master_docket_df()
+        st.sidebar.info(f"Loaded Master Docket from Google Sheets ({len(df_master)} records)")
+    except Exception as e:
+        pass
 
-st.header("📩 Raw Email Ingestion Staging")
-email_subject = st.text_input("Email Subject Line", placeholder="e.g. Official USPTO Notification: U.S. Trademark Application SN 99622671 -- Docket/Reference No. 302-TM-3")
-email_body = st.text_area("Email Content / HTML Body", height=200, placeholder="Paste USPTO notification or forwarded email body here...")
+# 2. Gmail Inbox Sync Section
+st.sidebar.header("📥 Inbox Sync")
+max_emails = st.sidebar.slider("Max Emails to Scan", min_value=5, max_value=50, value=20)
 
-if st.button("Parse & Generate Deadlines", type="primary"):
-    if not email_body and not email_subject:
-        st.warning("Please enter an email subject or body to process.")
+if st.sidebar.button("Fetch New USPTO Emails", type="primary"):
+    if fetch_uspto_emails is None:
+        st.sidebar.error("Gmail integration module (`src.gmail_client`) not found.")
+    elif "gmail" not in st.secrets:
+        st.sidebar.error("Gmail credentials missing from Streamlit secrets.")
     else:
-        parsed_info = parse_uspto_email_html(email_body, email_subject)
-        docket_records = enrich_and_format_docket(parsed_info, df_master)
+        with st.spinner("Scanning Gmail inbox for USPTO notifications..."):
+            try:
+                emails = fetch_uspto_emails(max_results=max_emails)
+                staged_records = []
+                
+                for em in emails:
+                    parsed = parse_uspto_email_html(em["body"], em["subject"])
+                    records = enrich_and_format_docket(parsed, df_master)
+                    staged_records.extend(records)
 
-        if "st_records" not in st.session_state:
-            st.session_state["st_records"] = []
-        
-        st.session_state["st_records"].extend(docket_records)
-        st.success("Email successfully parsed and staged!")
+                if "st_records" not in st.session_state:
+                    st.session_state["st_records"] = []
+
+                st.session_state["st_records"].extend(staged_records)
+                st.sidebar.success(f"Fetched {len(emails)} emails -> Staged {len(staged_records)} deadlines!")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Inbox Sync Error: {e}")
+
+# Manual Email Staging Input (Fallback / Testing)
+with st.expander("📝 Manual Email Ingestion (Testing / Override)"):
+    email_subject = st.text_input("Email Subject Line", placeholder="e.g. Official USPTO Notification: U.S. Trademark Application SN 99622671 -- Docket/Reference No. 302-TM-3")
+    email_body = st.text_area("Email Content / HTML Body", height=150, placeholder="Paste USPTO notification or forwarded email body here...")
+
+    if st.button("Parse & Generate Manual Deadlines"):
+        if not email_body and not email_subject:
+            st.warning("Please enter an email subject or body to process.")
+        else:
+            parsed_info = parse_uspto_email_html(email_body, email_subject)
+            docket_records = enrich_and_format_docket(parsed_info, df_master)
+
+            if "st_records" not in st.session_state:
+                st.session_state["st_records"] = []
+            
+            st.session_state["st_records"].extend(docket_records)
+            st.success("Manual email successfully parsed and staged!")
+            st.rerun()
 
 # Staging Review Table
 if "st_records" in st.session_state and st.session_state["st_records"]:
@@ -308,13 +359,28 @@ if "st_records" in st.session_state and st.session_state["st_records"]:
     # Display editable data editor
     edited_df = st.data_editor(df_staged, num_rows="dynamic", use_container_width=True)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns([1.5, 1.5, 3])
+    
     with col1:
+        if push_records_to_google_sheet is not None:
+            if st.button("🚀 Commit to Google Sheets", type="primary"):
+                with st.spinner("Writing records to Google Sheets..."):
+                    try:
+                        push_records_to_google_sheet(edited_df.to_dict("records"))
+                        st.success("Successfully committed to Google Sheets!")
+                        st.session_state["st_records"] = []
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Commit Error: {e}")
+
+    with col2:
         if st.button("Clear Queue"):
             st.session_state["st_records"] = []
             st.rerun()
             
-    with col2:
+    with col3:
         # Export to CSV / Excel
         csv = edited_df.to_csv(index=False).encode('utf-8')
         st.download_button("Download Formatted Docket (.csv)", data=csv, file_name="Formatted_TM_Deadlines.csv", mime="text/csv")
+else:
+    st.info("No deadlines currently staged. Click 'Fetch New USPTO Emails' in the sidebar or use manual ingestion above.")
